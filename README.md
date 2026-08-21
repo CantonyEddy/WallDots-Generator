@@ -7,16 +7,17 @@ d'écran. Une option permet de passer l'image en noir & blanc avant la
 transformation.
 
 Écrit en Rust — un binaire unique, aucune dépendance à l'exécution. Utilisable
-en ligne de commande (scriptable) ou via une interface interactive avec aperçu
-en temps réel (`--tui`).
+en ligne de commande (scriptable), via une interface interactive avec aperçu
+en temps réel (`--tui`), ou via un explorateur de fichiers intégré (`walldots`
+sans argument).
 
 ## Installation
 
 ### Depuis les sources
 
 ```sh
-git clone https://github.com/RYU/WallDots-generator.git
-cd WallDots-generator
+git clone https://github.com/CantonyEddy/WallDots-Generator.git
+cd WallDots-Generator
 cargo build --release
 # le binaire est dans ./target/release/walldots
 install -Dm755 target/release/walldots ~/.local/bin/walldots
@@ -66,6 +67,27 @@ source.
 L'aide de `walldots --help` est regroupée par fonctionnalité (Transformation en
 points, Noir & blanc, Sortie & mode).
 
+## Explorateur de fichiers
+
+Lancé **sans argument**, `walldots` ouvre un explorateur de fichiers intégré
+(façon `yazi`) pour parcourir tes dossiers, prévisualiser les images et en
+choisir une :
+
+```sh
+walldots
+```
+
+À gauche la liste du dossier courant (dossiers puis images, `../` pour
+remonter) ; à droite un aperçu **en vraie image** de l'image survolée (voir la
+note sur la qualité plus bas). `↑`/`↓` pour naviguer,
+`↵`/`→` pour entrer dans un dossier ou choisir une image (elle s'ouvre alors
+dans le mode interactif), `←` pour remonter, `q` pour quitter. Depuis le mode
+interactif, la touche `o` rouvre l'explorateur pour changer d'image.
+
+Une **barre de recherche** (au-dessus de l'arborescence) filtre les grandes
+bibliothèques : appuie sur `/`, tape pour filtrer les noms en direct, `↑`/`↓`
+pour parcourir les résultats, `↵` pour choisir, `Échap` pour effacer le filtre.
+
 ## Mode interactif (TUI)
 
 ```sh
@@ -73,29 +95,41 @@ walldots image.jpg --tui
 ```
 
 Ouvre une interface terminal avec, à gauche, tous les paramètres réglables et,
-à droite, un aperçu du rendu qui se met à jour à chaque modification. L'aperçu
-s'affiche en demi-blocs Unicode : il fonctionne sur n'importe quel terminal
-truecolor, sans protocole graphique particulier.
+à droite, un aperçu du rendu qui se met à jour à chaque modification (voir la
+note « Qualité de l'aperçu » plus bas).
 
 Raccourcis :
 
 | Touche | Action |
 |---|---|
 | `↑` / `↓` (ou `k` / `j`) | Naviguer entre les paramètres |
-| `←` / `→` (ou `h` / `l`) | Diminuer / augmenter la valeur |
-| `espace` / `entrée` | Cycler (mode N&B, forme, fond, inversion) |
+| `←` / `→` (ou `h` / `l`) | Ajuster la valeur pas à pas |
+| `entrée` | Saisir une valeur au clavier (grille, échelle, rayons, gamma, fond hex) ; cycler pour les champs à choix. `entrée` valide, `Échap` annule |
+| `espace` | Cycler (mode N&B, forme, fond, inversion, format) |
 | `z` | Zoom de l'aperçu (recadrage central agrandi) pour voir la forme des points |
+| `o` | Ouvrir l'explorateur de fichiers pour changer d'image |
 | `s` | Sauvegarder (PNG/SVG selon la config) |
 | `q` / `Échap` | Quitter |
+
+Tous les paramètres de la CLI sont réglables dans la TUI, y compris le format de sortie (`png`, `svg`, ou les deux).
 
 L'aperçu travaille sur une version réduite de l'image pour rester fluide ; la
 sauvegarde (`s`) génère toujours le rendu à pleine résolution.
 
-À forte densité de grille, chaque point ne couvre qu'environ un caractère du
-terminal : la composition et les couleurs sont fidèles, mais la forme exacte
-d'un point (cercle, carré arrondi, triangle, hexagone) n'est pas discernable à
-cette taille. La touche `z` bascule sur un aperçu zoomé (recadrage central
-agrandi) où la forme des points devient visible.
+La touche `z` bascule sur un aperçu zoomé (recadrage central agrandi) pour
+inspecter la forme des points de près.
+
+### Qualité de l'aperçu
+
+Les aperçus (explorateur et tuner) utilisent [`ratatui-image`](https://crates.io/crates/ratatui-image) :
+sur un terminal qui supporte un protocole graphique (**Kitty**, ex. kitty,
+ghostty, wezterm), l'image s'affiche en pleine qualité. Sur les autres
+terminaux, un repli automatique en **demi-blocs Unicode** garantit que ça
+fonctionne partout (à résolution moindre). Aucune bibliothèque C n'est requise.
+
+L'interface n'utilise que les **couleurs ANSI du terminal** (pas de couleur
+codée en dur) : elle suit donc ta palette et s'adapte automatiquement aux
+thèmes dynamiques (pywal, wallust, …).
 
 ### Exemples
 

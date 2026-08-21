@@ -1,10 +1,10 @@
 [package]
 name = "walldots"
-version = "2.2.0"
+version = "3.3.0"
 edition = "2021"
 description = "Transforme une image en grille de points type halftone, la taille suivant la luminosité et la couleur reprenant la teinte dominante locale."
 license = "GPL-3.0-or-later"
-repository = "https://github.com/RYU/WallDots-generator"
+repository = "https://github.com/CantonyEddy/WallDots-Generator"
 readme = "README.md"
 keywords = ["halftone", "dots", "image", "wallpaper", "cli"]
 categories = ["command-line-utilities", "multimedia::images"]
@@ -18,7 +18,10 @@ image = "0.25"
 tiny-skia = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
-ratatui = "0.29"
+ratatui = "0.30"
+# default-features off pour NE PAS lier chafa (lib C) — on garde les protocoles
+# pur-Rust (Kitty + demi-blocs de secours) via le backend crossterm.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 
 [profile.release]
 lto = true

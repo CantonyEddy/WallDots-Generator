@@ -1,30 +1,40 @@
 //! Interface interactive (TUI) pour régler les paramètres avec un aperçu en
 //! temps réel, puis exporter. Réutilise entièrement le cœur (config/pipeline).
 //!
-//! L'aperçu est rendu en demi-blocs Unicode (`▀`) : chaque cellule du terminal
-//! encode deux pixels verticaux (couleur de premier plan = pixel haut, couleur
-//! de fond = pixel bas). C'est portable sur n'importe quel terminal truecolor,
-//! sans dépendre d'un protocole graphique (kitty/sixel).
+//! L'aperçu est rendu via `ratatui-image` : vraie image (protocole Kitty/Sixel
+//! si le terminal le supporte) avec repli automatique en demi-blocs Unicode.
 
+use crate::browser::{Action as BrowserAction, Browser};
 use crate::config::{BwMode, Config, DotShape, Rgb};
+use crate::theme::{panel, selected_style, ACCENT, ACCENT2};
 use crate::{grid, pipeline, preprocess, render};
 use anyhow::Result;
-use image::{imageops::FilterType, RgbImage};
+use image::{imageops::FilterType, DynamicImage, RgbImage};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{Resize, StatefulImage};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 /// Taille max (en px) de l'image de travail servant à l'aperçu.
 const PREVIEW_SRC_MAX: u32 = 480;
 /// Nombre de paramètres réglables.
-const PARAM_COUNT: usize = 10;
+const PARAM_COUNT: usize = 11;
+
+/// Action demandée par le tuner suite à une touche.
+enum TunerAction {
+    None,
+    Quit,
+    OpenBrowser,
+}
 
 /// Presets de couleur de fond proposés dans la TUI.
 fn bg_presets() -> Vec<(&'static str, Rgb)> {
@@ -47,8 +57,14 @@ struct App {
     bg_index: usize,
     /// Aperçu zoomé (recadrage central agrandi) pour voir la forme des points.
     zoom: bool,
-    /// Cache de l'aperçu : (largeur, hauteur, lignes). Invalidé au moindre réglage.
-    cache: Option<(u16, u16, Vec<Line<'static>>)>,
+    /// Protocole d'image de l'aperçu (rendu haute qualité). Reconstruit si `dirty`.
+    protocol: Option<StatefulProtocol>,
+    /// L'aperçu doit être régénéré (un réglage a changé).
+    dirty: bool,
+    /// Saisie directe d'une valeur en cours (pour le champ sélectionné).
+    editing: bool,
+    /// Tampon de saisie.
+    edit_buf: String,
 }
 
 impl App {
@@ -73,7 +89,82 @@ impl App {
             bg_options,
             bg_index,
             zoom: false,
-            cache: None,
+            protocol: None,
+            dirty: true,
+            editing: false,
+            edit_buf: String::new(),
+        }
+    }
+
+    /// Le champ `i` accepte-t-il une saisie directe de valeur ?
+    fn is_typeable(i: usize) -> bool {
+        matches!(i, 0 | 1 | 3 | 4 | 5 | 6 | 9)
+    }
+
+    /// Démarre la saisie du champ sélectionné (pré-remplie avec la valeur courante).
+    fn start_edit(&mut self) {
+        if !Self::is_typeable(self.selected) {
+            return;
+        }
+        self.edit_buf = match self.selected {
+            0 => self.cfg.cols.to_string(),
+            1 => format!("{:.2}", self.cfg.scale),
+            3 => format!("{:.2}", self.cfg.threshold),
+            4 => format!("{:.2}", self.cfg.min_radius),
+            5 => format!("{:.2}", self.cfg.max_radius),
+            6 => format!("{:.2}", self.cfg.gamma),
+            9 => self.cfg.background.to_hex(),
+            _ => String::new(),
+        };
+        self.editing = true;
+    }
+
+    /// Valide la saisie : parse et applique la valeur (bornée), sinon signale l'erreur.
+    fn commit_edit(&mut self) {
+        let s = self.edit_buf.trim();
+        let mut ok = true;
+        match self.selected {
+            0 => match s.parse::<i64>() {
+                Ok(v) => self.cfg.cols = v.clamp(2, 600) as u32,
+                Err(_) => ok = false,
+            },
+            1 => match s.parse::<f32>() {
+                Ok(v) => self.cfg.scale = v.clamp(0.25, 8.0),
+                Err(_) => ok = false,
+            },
+            3 => match s.parse::<f32>() {
+                Ok(v) => self.cfg.threshold = v.clamp(0.0, 1.0),
+                Err(_) => ok = false,
+            },
+            4 => match s.parse::<f32>() {
+                Ok(v) => self.cfg.min_radius = v.clamp(0.0, self.cfg.max_radius),
+                Err(_) => ok = false,
+            },
+            5 => match s.parse::<f32>() {
+                Ok(v) => self.cfg.max_radius = v.clamp(self.cfg.min_radius, 2.0),
+                Err(_) => ok = false,
+            },
+            6 => match s.parse::<f32>() {
+                Ok(v) => self.cfg.gamma = v.clamp(0.1, 5.0),
+                Err(_) => ok = false,
+            },
+            9 => match s.parse::<Rgb>() {
+                Ok(c) => {
+                    self.cfg.background = c;
+                    if let Some(i) = self.bg_options.iter().position(|(_, x)| *x == c) {
+                        self.bg_index = i;
+                    }
+                }
+                Err(_) => ok = false,
+            },
+            _ => {}
+        }
+        self.editing = false;
+        self.edit_buf.clear();
+        if ok {
+            self.dirty = true;
+        } else {
+            self.status = "valeur invalide".to_string();
         }
     }
 
@@ -89,11 +180,16 @@ impl App {
             7 => "Inverser taille",
             8 => "Forme",
             9 => "Fond",
+            10 => "Format de sortie",
             _ => "",
         }
     }
 
     fn value(&self, i: usize) -> String {
+        // Champ en cours de saisie : afficher le tampon + curseur.
+        if self.editing && i == self.selected {
+            return format!("{}▏", self.edit_buf);
+        }
         match i {
             0 => self.cfg.cols.to_string(),
             1 => format!("{:.2}x", self.cfg.scale),
@@ -108,7 +204,21 @@ impl App {
             6 => format!("{:.2}", self.cfg.gamma),
             7 => if self.cfg.invert { "oui" } else { "non" }.into(),
             8 => self.cfg.shape.label().into(),
-            9 => self.bg_options[self.bg_index].0.clone(),
+            9 => {
+                // Nom du preset si le fond en est un, sinon la valeur hex.
+                let bg = self.cfg.background;
+                self.bg_options
+                    .iter()
+                    .find(|(_, c)| *c == bg)
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_else(|| bg.to_hex())
+            }
+            10 => match (self.cfg.png, self.cfg.svg) {
+                (true, true) => "png + svg".into(),
+                (true, false) => "png".into(),
+                (false, true) => "svg".into(),
+                (false, false) => "png".into(),
+            },
             _ => String::new(),
         }
     }
@@ -154,15 +264,46 @@ impl App {
                 self.bg_index = (((self.bg_index as i32 + dir) % n + n) % n) as usize;
                 self.cfg.background = self.bg_options[self.bg_index].1;
             }
+            10 => {
+                // Cycle png -> svg -> png+svg.
+                let cur = match (self.cfg.png, self.cfg.svg) {
+                    (true, false) => 0,
+                    (false, true) => 1,
+                    _ => 2,
+                };
+                let next = ((cur + dir) % 3 + 3) % 3;
+                (self.cfg.png, self.cfg.svg) = match next {
+                    0 => (true, false),
+                    1 => (false, true),
+                    _ => (true, true),
+                };
+            }
             _ => {}
         }
-        self.cache = None; // un réglage invalide l'aperçu
+        self.dirty = true; // un réglage invalide l'aperçu
     }
 
-    /// Renvoie true si l'application doit se fermer.
-    fn handle_key(&mut self, code: KeyCode) -> bool {
+    fn handle_key(&mut self, code: KeyCode) -> TunerAction {
+        // Saisie directe d'une valeur : les touches alimentent le tampon.
+        if self.editing {
+            match code {
+                KeyCode::Enter => self.commit_edit(),
+                KeyCode::Esc => {
+                    self.editing = false;
+                    self.edit_buf.clear();
+                }
+                KeyCode::Backspace => {
+                    self.edit_buf.pop();
+                }
+                KeyCode::Char(c) => self.edit_buf.push(c),
+                _ => {}
+            }
+            return TunerAction::None;
+        }
+
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('q') | KeyCode::Esc => return TunerAction::Quit,
+            KeyCode::Char('o') => return TunerAction::OpenBrowser,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = (self.selected + PARAM_COUNT - 1) % PARAM_COUNT;
             }
@@ -171,15 +312,23 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
-            KeyCode::Char(' ') | KeyCode::Enter => self.adjust(1),
+            // ↵ : saisir une valeur (champs numériques/hex) ou cycler (champs à choix).
+            KeyCode::Enter => {
+                if Self::is_typeable(self.selected) {
+                    self.start_edit();
+                } else {
+                    self.adjust(1);
+                }
+            }
+            KeyCode::Char(' ') => self.adjust(1),
             KeyCode::Char('z') => {
                 self.zoom = !self.zoom;
-                self.cache = None;
+                self.dirty = true;
             }
             KeyCode::Char('s') => self.save(),
             _ => {}
         }
-        false
+        TunerAction::None
     }
 
     fn save(&mut self) {
@@ -192,89 +341,36 @@ impl App {
         }
     }
 
-    /// Construit les lignes de l'aperçu pour une zone de `w`×`h` cellules.
-    fn build_preview(&self, w: u16, h: u16) -> Vec<Line<'static>> {
-        let cw = w.max(1) as u32;
-        let ch = (h.max(1) as u32) * 2; // deux pixels verticaux par cellule
-
-        let sw = self.preview_src.width() as f32;
-        let sh = self.preview_src.height() as f32;
-        let src_aspect = sw / sh;
-        let canvas_aspect = cw as f32 / ch as f32;
-
-        // Ajuste l'image dans le canevas en conservant les proportions.
-        let (fw, fh) = if src_aspect > canvas_aspect {
-            (cw, ((cw as f32) / src_aspect).round().max(1.0) as u32)
+    /// Rend l'aperçu dotifié en une `RgbImage` haute résolution.
+    ///
+    /// Mode ajusté : l'image entière ; mode zoom : recadrage central agrandi
+    /// (chaque point couvre plus de pixels, la forme devient nette).
+    fn preview_image(&self) -> Option<RgbImage> {
+        // Source, éventuellement recadrée au centre en mode zoom.
+        let src = if self.zoom {
+            let (sw, sh) = (self.preview_src.width(), self.preview_src.height());
+            let cw = ((sw as f32 * 0.4).round() as u32).max(1);
+            let ch = ((sh as f32 * 0.4).round() as u32).max(1);
+            let x = (sw.saturating_sub(cw)) / 2;
+            let y = (sh.saturating_sub(ch)) / 2;
+            image::imageops::crop_imm(&self.preview_src, x, y, cw, ch).to_image()
         } else {
-            (((ch as f32) * src_aspect).round().max(1.0) as u32, ch)
+            self.preview_src.clone()
         };
 
-        // Config d'aperçu.
-        // - mode ajusté : l'image entière tient dans le canevas (~fw de large).
-        // - mode zoom : chaque cellule fait ZOOM_CELL_PX pixels pour que la forme
-        //   des points soit visible ; le canevas montre alors un recadrage centré.
+        let mut img = src;
+        preprocess::apply(&mut img, self.cfg.bw, self.cfg.threshold);
+
+        // Résolution de rendu : ~10 px par cellule (net), plafonnée.
+        let target_w = (self.cfg.cols as f32 * 10.0).clamp(240.0, 1600.0);
         let mut pcfg = self.cfg.clone();
-        pcfg.scale = if self.zoom {
-            const ZOOM_CELL_PX: f32 = 8.0;
-            (self.cfg.cols as f32 * ZOOM_CELL_PX) / sw
-        } else {
-            fw as f32 / sw
-        };
+        pcfg.scale = target_w / img.width() as f32;
 
-        let mut img = self.preview_src.clone();
-        preprocess::apply(&mut img, pcfg.bw, pcfg.threshold);
         let dot_grid = grid::build(&img, &pcfg);
-
-        let bg = self.cfg.background;
-        let canvas = (|| -> Option<Pixmap> {
-            let gp = render::render_pixmap(&dot_grid, bg, self.cfg.shape).ok()?;
-            let mut canvas = Pixmap::new(cw, ch)?;
-            canvas.fill(tiny_skia::Color::from_rgba8(bg.r, bg.g, bg.b, 255));
-            // Centrage signé : en zoom, gp est plus grand que le canevas et
-            // l'offset négatif produit un recadrage centré (draw_pixmap clippe).
-            let ox = (cw as i32 - gp.width() as i32) / 2;
-            let oy = (ch as i32 - gp.height() as i32) / 2;
-            canvas.draw_pixmap(
-                ox,
-                oy,
-                gp.as_ref(),
-                &PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
-            Some(canvas)
-        })();
-
-        let Some(canvas) = canvas else {
-            return vec![Line::from("aperçu indisponible")];
-        };
-
-        let _ = fh; // (info de cadrage, non utilisée directement)
-        let mut lines = Vec::with_capacity(h as usize);
-        for cy in 0..h as u32 {
-            let mut spans = Vec::with_capacity(cw as usize);
-            for cx in 0..cw {
-                let top = canvas
-                    .pixel(cx, cy * 2)
-                    .map(|p| p.demultiply())
-                    .unwrap_or_else(|| tiny_skia::ColorU8::from_rgba(bg.r, bg.g, bg.b, 255));
-                let bot = canvas
-                    .pixel(cx, cy * 2 + 1)
-                    .map(|p| p.demultiply())
-                    .unwrap_or_else(|| tiny_skia::ColorU8::from_rgba(bg.r, bg.g, bg.b, 255));
-                spans.push(Span::styled(
-                    "▀",
-                    Style::default()
-                        .fg(Color::Rgb(top.red(), top.green(), top.blue()))
-                        .bg(Color::Rgb(bot.red(), bot.green(), bot.blue())),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-        lines
+        render::render_rgb(&dot_grid, self.cfg.background, self.cfg.shape).ok()
     }
 
-    fn draw(&mut self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame, picker: &mut Picker) {
         let area = frame.area();
         let root = Layout::default()
             .direction(Direction::Vertical)
@@ -287,7 +383,7 @@ impl App {
             .split(root[0]);
 
         self.draw_params(frame, cols[0]);
-        self.draw_preview(frame, cols[1]);
+        self.draw_preview(frame, cols[1], picker);
         self.draw_footer(frame, root[1]);
     }
 
@@ -299,32 +395,26 @@ impl App {
             let label = format!("{marker}{}", self.label(i));
             let value = self.value(i);
             let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                selected_style(Style::default())
             } else {
                 Style::default()
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{label:<24}"), style),
                 Span::raw(" "),
-                Span::styled(value, Style::default().fg(Color::Yellow)),
+                Span::styled(value, Style::default().fg(ACCENT2)),
             ]));
         }
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Paramètres ");
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        frame.render_widget(Paragraph::new(lines).block(panel(" Paramètres ")), area);
     }
 
-    fn draw_preview(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw_preview(&mut self, frame: &mut Frame, area: Rect, picker: &mut Picker) {
         let title = if self.zoom {
             " Aperçu — zoom (recadrage central) "
         } else {
             " Aperçu "
         };
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = panel(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -332,32 +422,34 @@ impl App {
             return;
         }
 
-        let need = match &self.cache {
-            Some((w, h, _)) => *w != inner.width || *h != inner.height,
-            None => true,
-        };
-        if need {
-            let lines = self.build_preview(inner.width, inner.height);
-            self.cache = Some((inner.width, inner.height, lines));
+        if self.dirty || self.protocol.is_none() {
+            if let Some(rgb) = self.preview_image() {
+                self.protocol = Some(picker.new_resize_protocol(DynamicImage::ImageRgb8(rgb)));
+            }
+            self.dirty = false;
         }
-        if let Some((_, _, lines)) = &self.cache {
-            frame.render_widget(Paragraph::new(Text::from(lines.clone())), inner);
+        if let Some(proto) = self.protocol.as_mut() {
+            // Crop = l'image couvre toute la zone (remplit, sans bandes noires).
+            let widget = StatefulImage::default().resize(Resize::Crop(None));
+            frame.render_stateful_widget(widget, inner, proto);
         }
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let help = Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+            Span::styled("↑↓", Style::default().fg(ACCENT)),
             Span::raw(" paramètre  "),
-            Span::styled("←→", Style::default().fg(Color::Cyan)),
+            Span::styled("←→", Style::default().fg(ACCENT)),
             Span::raw(" ajuster  "),
-            Span::styled("espace", Style::default().fg(Color::Cyan)),
-            Span::raw(" cycler  "),
-            Span::styled("z", Style::default().fg(Color::Cyan)),
+            Span::styled("↵", Style::default().fg(ACCENT)),
+            Span::raw(" saisir/cycler  "),
+            Span::styled("z", Style::default().fg(ACCENT)),
             Span::raw(" zoom  "),
-            Span::styled("s", Style::default().fg(Color::Cyan)),
+            Span::styled("s", Style::default().fg(ACCENT)),
             Span::raw(" sauver  "),
-            Span::styled("q", Style::default().fg(Color::Cyan)),
+            Span::styled("o", Style::default().fg(ACCENT)),
+            Span::raw(" fichiers  "),
+            Span::styled("q", Style::default().fg(ACCENT)),
             Span::raw(" quitter"),
         ]);
         let status = Line::from(Span::styled(
@@ -365,9 +457,7 @@ impl App {
             Style::default().fg(Color::Green),
         ));
         frame.render_widget(
-            Paragraph::new(vec![help, status])
-                .alignment(Alignment::Left)
-                .wrap(Wrap { trim: true }),
+            Paragraph::new(vec![help, status]).alignment(Alignment::Left),
             area,
         );
     }
@@ -410,62 +500,122 @@ mod tests {
     }
 
     #[test]
-    fn preview_has_expected_shape() {
-        // Image de test avec un dégradé (donc des points de tailles variées).
+    fn preview_image_dimensions() {
+        // L'aperçu dotifié est une image non vide.
         let mut img = RgbImage::new(200, 120);
         for (x, _y, p) in img.enumerate_pixels_mut() {
             let v = (x * 255 / 200) as u8;
             *p = image::Rgb([v, v, v]);
         }
         let app = App::new(cfg(), img);
-        let (w, h) = (40u16, 20u16);
-        let lines = app.build_preview(w, h);
-        assert_eq!(lines.len(), h as usize, "une ligne par rangée de cellules");
-        for line in &lines {
-            assert_eq!(line.spans.len(), w as usize, "un span par colonne");
-        }
+        let out = app.preview_image().expect("aperçu");
+        assert!(out.width() > 0 && out.height() > 0);
     }
 
     #[test]
     fn full_frame_draws_and_shows_preview() {
         use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::Picker;
         let mut img = RgbImage::new(160, 90);
         for (x, y, p) in img.enumerate_pixels_mut() {
             let v = (((x + y) * 255) / 250) as u8;
             *p = image::Rgb([v, v / 2, 255 - v]);
         }
         let mut app = App::new(cfg(), img);
+        let mut picker = Picker::halfblocks();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal.draw(|f| app.draw(f, &mut picker)).unwrap();
 
-        let buf = terminal.backend().buffer();
-        // L'aperçu utilise le demi-bloc « ▀ » : il doit apparaître à l'écran.
-        let has_halfblock = buf.content().iter().any(|c| c.symbol() == "▀");
-        assert!(has_halfblock, "l'aperçu devrait contenir des demi-blocs");
-        // Et le panneau de paramètres doit afficher au moins un libellé.
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        // Le panneau de paramètres doit afficher au moins un libellé.
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         assert!(dump.contains("Grille"), "le panneau de paramètres manque");
     }
 
     #[test]
-    fn zoom_preview_differs_by_shape() {
-        // Image claire et uniforme -> gros points, forme visible en zoom.
+    fn format_cycles_through_three_states() {
+        let mut app = App::new(cfg(), RgbImage::new(20, 20));
+        app.selected = 10;
+        let seen: Vec<(bool, bool)> = (0..3)
+            .map(|_| {
+                let st = (app.cfg.png, app.cfg.svg);
+                app.adjust(1);
+                st
+            })
+            .collect();
+        // Les trois états distincts apparaissent, aucun (false,false).
+        assert!(seen.contains(&(true, true)));
+        assert!(seen.contains(&(true, false)));
+        assert!(seen.contains(&(false, true)));
+        assert!(!seen.contains(&(false, false)));
+        // Retour au point de départ après 3 pas.
+        assert_eq!((app.cfg.png, app.cfg.svg), seen[0]);
+    }
+
+    #[test]
+    fn preview_differs_by_shape() {
+        // Image claire uniforme -> gros points ; cercle et carré diffèrent.
         let img = RgbImage::from_pixel(160, 100, image::Rgb([230, 230, 230]));
         let mut circle = App::new(cfg(), img.clone());
-        circle.zoom = true;
         circle.cfg.shape = DotShape::Circle;
         let mut square = App::new(cfg(), img);
-        square.zoom = true;
         square.cfg.shape = DotShape::Square;
 
-        let (w, h) = (60u16, 30u16);
-        let lc = circle.build_preview(w, h);
-        let ls = square.build_preview(w, h);
+        let ic = circle.preview_image().expect("aperçu cercle");
+        let is = square.preview_image().expect("aperçu carré");
         assert_ne!(
-            lc, ls,
-            "en zoom, cercle et carré doivent produire des aperçus différents"
+            ic.as_raw(),
+            is.as_raw(),
+            "cercle et carré doivent produire des aperçus différents"
         );
+    }
+
+    #[test]
+    fn typing_sets_value_directly() {
+        let mut app = App::new(cfg(), RgbImage::new(20, 20));
+        // Grille : saisir 250.
+        app.selected = 0;
+        app.handle_key(KeyCode::Enter);
+        assert!(app.editing);
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Backspace);
+        }
+        for c in "250".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.editing);
+        assert_eq!(app.cfg.cols, 250);
+
+        // Fond : saisir un hex.
+        app.selected = 9;
+        app.handle_key(KeyCode::Enter);
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Backspace);
+        }
+        for c in "#123456".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.cfg.background, Rgb { r: 0x12, g: 0x34, b: 0x56 });
+
+        // Valeur invalide : ignorée, l'ancienne reste.
+        app.selected = 0;
+        app.handle_key(KeyCode::Enter);
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Backspace);
+        }
+        for c in "abc".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.cfg.cols, 250, "valeur invalide -> inchangée");
     }
 
     #[test]
@@ -487,23 +637,147 @@ mod tests {
     }
 }
 
-/// Lance la TUI. Charge l'image, prépare l'aperçu, puis boucle jusqu'à `q`.
-pub fn run(cfg: Config) -> Result<()> {
-    cfg.validate().map_err(anyhow::Error::msg)?;
+/// Construit un tuner à partir d'une config (ouvre l'image + prépare l'aperçu).
+fn build_tuner(cfg: Config) -> Result<App> {
     let full = image::open(&cfg.input)
         .map_err(|e| anyhow::anyhow!("ouverture de l'image {} : {e}", cfg.input.display()))?
         .to_rgb8();
     let preview_src = downscale(&full, PREVIEW_SRC_MAX);
-    drop(full);
+    Ok(App::new(cfg, preview_src))
+}
 
-    let mut app = App::new(cfg, preview_src);
+/// Chemin de sortie par défaut pour une image : "<image>_dots".
+fn derive_output(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "walldots".to_string());
+    let mut p = input.to_path_buf();
+    p.set_file_name(format!("{stem}_dots"));
+    p
+}
+
+enum Mode {
+    Browser,
+    Tuner,
+}
+
+/// Coordonne l'explorateur de fichiers et le tuner.
+struct Ui {
+    mode: Mode,
+    browser: Browser,
+    tuner: Option<App>,
+    /// Config courante (sert de gabarit en chargeant une nouvelle image).
+    cfg: Config,
+    /// Détecteur du meilleur protocole d'image du terminal.
+    picker: Picker,
+}
+
+impl Ui {
+    fn draw(&mut self, frame: &mut Frame) {
+        // Emprunts disjoints des champs pour satisfaire le borrow-checker.
+        let Ui {
+            mode,
+            browser,
+            tuner,
+            picker,
+            ..
+        } = self;
+        match mode {
+            Mode::Tuner => {
+                if let Some(t) = tuner.as_mut() {
+                    t.draw(frame, picker);
+                }
+            }
+            Mode::Browser => {
+                let area = frame.area();
+                browser.draw(frame, area, picker);
+            }
+        }
+    }
+
+    /// Renvoie true si l'application doit se fermer.
+    fn handle_key(&mut self, code: KeyCode) -> bool {
+        match self.mode {
+            Mode::Tuner => {
+                if let Some(t) = self.tuner.as_mut() {
+                    match t.handle_key(code) {
+                        TunerAction::Quit => return true,
+                        TunerAction::OpenBrowser => {
+                            self.cfg = t.cfg.clone(); // conserver les réglages
+                            self.mode = Mode::Browser;
+                        }
+                        TunerAction::None => {}
+                    }
+                }
+            }
+            Mode::Browser => match self.browser.handle_key(code) {
+                BrowserAction::Quit => return true,
+                BrowserAction::Back => {
+                    if self.tuner.is_some() {
+                        self.mode = Mode::Tuner;
+                    } else {
+                        return true; // aucun tuner à retrouver -> on quitte
+                    }
+                }
+                BrowserAction::Open(path) => {
+                    let mut cfg = self.cfg.clone();
+                    cfg.output = derive_output(&path);
+                    cfg.input = path;
+                    match build_tuner(cfg) {
+                        Ok(app) => {
+                            self.tuner = Some(app);
+                            self.mode = Mode::Tuner;
+                        }
+                        Err(e) => self.browser.set_status(format!("Erreur : {e}")),
+                    }
+                }
+                BrowserAction::None => {}
+            },
+        }
+        false
+    }
+}
+
+/// Lance la TUI. Si `start_in_browser`, ouvre l'explorateur ; sinon le tuner sur
+/// l'image de `cfg.input`.
+pub fn run(cfg: Config, start_in_browser: bool) -> Result<()> {
+    // Interroge le terminal AVANT de passer en mode alterné ; repli demi-blocs.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
+    let mut ui = if start_in_browser {
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Ui {
+            mode: Mode::Browser,
+            browser: Browser::new(dir),
+            tuner: None,
+            cfg,
+            picker,
+        }
+    } else {
+        cfg.validate().map_err(anyhow::Error::msg)?;
+        let app = build_tuner(cfg.clone())?;
+        let dir = cfg
+            .input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ui {
+            mode: Mode::Tuner,
+            browser: Browser::new(dir),
+            tuner: Some(app),
+            cfg,
+            picker,
+        }
+    };
+
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         loop {
-            terminal.draw(|frame| app.draw(frame))?;
+            terminal.draw(|frame| ui.draw(frame))?;
             if event::poll(Duration::from_millis(200))? {
                 if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && app.handle_key(key.code) {
+                    if key.kind == KeyEventKind::Press && ui.handle_key(key.code) {
                         break;
                     }
                 }

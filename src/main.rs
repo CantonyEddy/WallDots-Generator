@@ -4,12 +4,14 @@
 //! la teinte dominante des pixels environnants. Une option permet de passer
 //! l'image en noir & blanc avant la transformation.
 
+mod browser;
 mod color;
 mod config;
 mod grid;
 mod pipeline;
 mod preprocess;
 mod render;
+mod theme;
 mod tui;
 
 use clap::Parser;
@@ -49,14 +51,15 @@ L'aide est regroupée par fonctionnalité ci-dessous. Exemples :
   walldots photo.jpg                       # PNG + SVG, réglages par défaut
   walldots photo.jpg -g 160 -f png         # grille fine, PNG seul
   walldots photo.jpg --bw grayscale        # halftone noir & blanc
-  walldots photo.jpg --tui                 # réglage interactif avec aperçu";
+  walldots photo.jpg --tui                 # réglage interactif avec aperçu
+  walldots                                 # explorateur de fichiers (choisir l'image)";
 
 /// Transforme une image en grille de points (halftone) pour en faire un wallpaper.
 #[derive(Parser, Debug)]
 #[command(name = "walldots", version, about, long_about = LONG_ABOUT)]
 struct Cli {
-    /// Image d'entrée (png, jpg, webp, …).
-    input: PathBuf,
+    /// Image d'entrée (png, jpg, webp, …). Omise : ouvre l'explorateur de fichiers.
+    input: Option<PathBuf>,
 
     // ---- Transformation en points ------------------------------------------
     /// Nombre de points sur la largeur (résolution de la grille).
@@ -118,15 +121,22 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let output = cli.output.unwrap_or_else(|| {
-        let stem = cli
-            .input
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "walldots".to_string());
-        let mut p = cli.input.clone();
-        p.set_file_name(format!("{stem}_dots"));
-        p
+    // Sans image en argument : on ouvre l'explorateur de fichiers (TUI).
+    let browse = cli.input.is_none();
+
+    // Chemin de sortie : -o, sinon dérivé de l'image ("<image>_dots"), sinon vide
+    // (rempli quand l'utilisateur choisit une image dans l'explorateur).
+    let output = cli.output.clone().unwrap_or_else(|| match &cli.input {
+        Some(input) => {
+            let stem = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "walldots".to_string());
+            let mut p = input.clone();
+            p.set_file_name(format!("{stem}_dots"));
+            p
+        }
+        None => PathBuf::new(),
     });
 
     let (png, svg) = match cli.format {
@@ -136,7 +146,7 @@ fn main() -> ExitCode {
     };
 
     let cfg = Config {
-        input: cli.input,
+        input: cli.input.clone().unwrap_or_default(),
         output,
         cols: cli.grid,
         scale: cli.scale,
@@ -152,8 +162,9 @@ fn main() -> ExitCode {
         svg,
     };
 
-    if cli.tui {
-        return match tui::run(cfg) {
+    // Explorateur (sans image) ou tuner (--tui avec image) → interface interactive.
+    if browse || cli.tui {
+        return match tui::run(cfg, browse) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("erreur : {e:#}");

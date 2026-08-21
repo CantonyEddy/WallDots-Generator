@@ -152,6 +152,20 @@ pub fn render_pixmap(grid: &DotGrid, bg: Rgb, shape: DotShape) -> Result<Pixmap>
     Ok(pixmap)
 }
 
+/// Rastérise la grille en `RgbImage` (pour l'aperçu haute qualité de la TUI).
+pub fn render_rgb(grid: &DotGrid, bg: Rgb, shape: DotShape) -> Result<image::RgbImage> {
+    let pm = render_pixmap(grid, bg, shape)?;
+    let (w, h) = (pm.width(), pm.height());
+    let mut img = image::RgbImage::new(w, h);
+    for (i, px) in pm.pixels().iter().enumerate() {
+        let c = px.demultiply();
+        let x = i as u32 % w;
+        let y = i as u32 / w;
+        img.put_pixel(x, y, image::Rgb([c.red(), c.green(), c.blue()]));
+    }
+    Ok(img)
+}
+
 /// Rastérise la grille en PNG anti-crénelé et l'écrit sur disque.
 pub fn save_png(grid: &DotGrid, bg: Rgb, shape: DotShape, path: &Path) -> Result<()> {
     let pixmap = render_pixmap(grid, bg, shape)?;
